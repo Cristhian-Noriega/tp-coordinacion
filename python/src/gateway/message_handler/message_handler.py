@@ -37,5 +37,5 @@ class MessageHandler:
         ):
             logging.info(f"Gateway: Deserialized result for client {self.client_id}: top={fields[1]}")
             return fields[1]
-        logging.warning(f"Gateway: Invalid result message for client {self.client_id}: {fields}")
+        logging.debug(f"Gateway: Ignoring message for other client: {fields}")
         return []
