@@ -1,7 +1,7 @@
 import os
 import logging
 import bisect
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from common import middleware, message_protocol, fruit_item
 
@@ -9,7 +9,7 @@ from common import middleware, message_protocol, fruit_item
 # ahora mantengo un top por cliente, y cuando llega EOF, envio el top final
 
 DATA_MSG_LENGTH = 3
-EOF_MSG_LENGTH = 1
+EOF_MSG_LENGTH = 2
 
 class Config:
     ID = int(os.environ.get("ID", 0))
@@ -18,6 +18,7 @@ class Config:
     AGGREGATION_PREFIX = os.environ.get("AGGREGATION_PREFIX", "agg_prefix")
     TOP_SIZE = int(os.environ.get("TOP_SIZE", 3))
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+    SUM_AMOUNT = int(os.environ.get("SUM_AMOUNT", 1))
 
 class AggregationFilter:
     def __init__(self, config: Config):
@@ -35,6 +36,8 @@ class AggregationFilter:
         )
         
         self.storage: Dict[str, List[fruit_item.FruitItem]] = {}
+        self.sums_completed: Dict[str, Set[int]] = {}
+        self.sum_amount = int(os.environ.get("SUM_AMOUNT", 1))
 
     def _update_top(self, client_id: str, fruit: str, amount: int):
         fruit_list = self.storage.setdefault(client_id, [])
@@ -71,11 +74,26 @@ class AggregationFilter:
             fields = message_protocol.internal.deserialize(body)
             
             if len(fields) == DATA_MSG_LENGTH:
-                self._update_top(*fields)
+                self._update_top(fields[0], fields[1], fields[2])
+                
             elif len(fields) == EOF_MSG_LENGTH:
-                self._send_final_result(fields[0])
+                client_id = fields[0]
+                sum_id = fields[1]
+                
+                if client_id not in self.sums_completed:
+                    self.sums_completed[client_id] = set()
+                
+                self.sums_completed[client_id].add(sum_id)
+                
+                logging.info(f"Aggregator {self.id}: Received EOF from Sum {sum_id} for client {client_id} "
+                           f"({len(self.sums_completed[client_id])}/{self.config.SUM_AMOUNT})")
+                
+                if len(self.sums_completed[client_id]) == self.sum_amount:
+                    self._send_final_result(client_id)
+                    del self.sums_completed[client_id]
             
             ack()
+            
         except Exception as e:
             logging.error(f"Aggregator {self.id}: Error processing message: {e}")
             nack(requeue=True)

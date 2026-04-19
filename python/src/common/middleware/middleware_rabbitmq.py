@@ -88,28 +88,36 @@ class MessageMiddlewareQueueRabbitMQ(_RabbitMQBase, MessageMiddlewareQueue):
         
 class MessageMiddlewareExchangeRabbitMQ(_RabbitMQBase, MessageMiddlewareExchange):
     
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, exchange_type="direct"):
         super().__init__(host)
         self._exchange_name = exchange_name
+        self._exchange_type = exchange_type
         self._exchange = self._channel.exchange_declare(
             exchange=exchange_name,
-            exchange_type='direct',
+            exchange_type=exchange_type,
             durable=True,
         )
         self._routing_keys = routing_keys
 
     
     def send(self, message):
-        if not self._routing_keys:
-            raise MessageMiddlewareMessageError("No routing keys provided")
-        
         try:
-            for key in self._routing_keys:
+            if self._exchange_type == 'fanout':
                 self._channel.basic_publish(
                     exchange=self._exchange_name,
-                    routing_key=key,
+                    routing_key='',
                     body=message,
                 )
+            else:
+                if not self._routing_keys:
+                    raise MessageMiddlewareMessageError("No routing keys provided")
+                
+                for key in self._routing_keys:
+                    self._channel.basic_publish(
+                        exchange=self._exchange_name,
+                        routing_key=key,
+                        body=message,
+                    )
         except _CONNECTION_ERRORS as e:
             raise MessageMiddlewareDisconnectedError(e)
         except Exception as e:
@@ -123,8 +131,19 @@ class MessageMiddlewareExchangeRabbitMQ(_RabbitMQBase, MessageMiddlewareExchange
     def _init_queue(self):
         if self._queue_name: 
             return
-
-        queue_result = self._channel.queue_declare(queue='',exclusive=True)
+        queue_result = self._channel.queue_declare(queue='', exclusive=True)
         self._queue_name = queue_result.method.queue
-        for key in self._routing_keys:
-            self._channel.queue_bind(queue=self._queue_name, exchange=self._exchange_name, routing_key=key)
+
+        if self._exchange_type == 'fanout':
+            self._channel.queue_bind(
+                queue=self._queue_name,
+                exchange=self._exchange_name,
+                routing_key=''
+            )
+        else:
+            for key in self._routing_keys:
+                self._channel.queue_bind(
+                    queue=self._queue_name,
+                    exchange=self._exchange_name,
+                    routing_key=key
+                )

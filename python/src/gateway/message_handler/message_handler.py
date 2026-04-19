@@ -26,7 +26,7 @@ class MessageHandler:
 
     def serialize_eof_message(self, message):
         logging.info(f"Gateway: Serializing EOF for client {self.client_id}")
-        return message_protocol.internal.serialize_client_eof(self.client_id)
+        return message_protocol.internal.serialize_client_eof(self.client_id, 0)
 
     def deserialize_result_message(self, message):
         fields = message_protocol.internal.deserialize(message)
