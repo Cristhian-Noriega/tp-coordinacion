@@ -1,72 +1,94 @@
 import os
 import logging
 import bisect
+from typing import Dict, List
 
 from common import middleware, message_protocol, fruit_item
 
-ID = int(os.environ["ID"])
-MOM_HOST = os.environ["MOM_HOST"]
-OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-TOP_SIZE = int(os.environ["TOP_SIZE"])
+# cambio el Aggregator para procesar datos por cliente en lugar de globalmente
+# ahora mantengo un top por cliente, y cuando llega EOF, envio el top final
 
+DATA_MSG_LENGTH = 3
+EOF_MSG_LENGTH = 1
+
+class Config:
+    ID = int(os.environ.get("ID", 0))
+    MOM_HOST = os.environ.get("MOM_HOST", "localhost")
+    OUTPUT_QUEUE = os.environ.get("OUTPUT_QUEUE", "output")
+    AGGREGATION_PREFIX = os.environ.get("AGGREGATION_PREFIX", "agg_prefix")
+    TOP_SIZE = int(os.environ.get("TOP_SIZE", 3))
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 class AggregationFilter:
-
-    def __init__(self):
+    def __init__(self, config: Config):
+        self.config = config
+        self.id = config.ID
+        
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
+            config.MOM_HOST, 
+            config.AGGREGATION_PREFIX, 
+            [f"{config.AGGREGATION_PREFIX}_{self.id}"]
         )
+        
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, OUTPUT_QUEUE
+            config.MOM_HOST, config.OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        
+        self.storage: Dict[str, List[fruit_item.FruitItem]] = {}
 
-    def _process_data(self, fruit, amount):
-        logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+    def _update_top(self, client_id: str, fruit: str, amount: int):
+        fruit_list = self.storage.setdefault(client_id, [])
+        new_item = fruit_item.FruitItem(fruit, int(amount))
+
+        for i, item in enumerate(fruit_list):
+            if item.fruit == fruit:
+                updated_item = item + new_item
+                fruit_list.pop(i)
+                bisect.insort(fruit_list, updated_item)
                 return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        bisect.insort(fruit_list, new_item)
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
-        ack()
+    def _send_final_result(self, client_id: str):
+        # al recibir EOF, tomo el top de frutas y lo envío al joiner
+        if client_id not in self.storage:
+            logging.warning(f"Aggregator {self.id}: No data for client {client_id}")
+            return
+
+        top_items = self.storage[client_id][-self.config.TOP_SIZE:]
+        top_items.reverse()
+
+        formatted_results = [(fruit_item.fruit, fruit_item.amount) for fruit_item in top_items]
+
+        logging.info(f"Aggregator {self.id}: Sending TOP {self.config.TOP_SIZE} for client {client_id}")
+        
+        msg = message_protocol.internal.serialize_client_result(client_id, formatted_results)
+        self.output_queue.send(msg)
+        del self.storage[client_id]
+
+    def on_message_received(self, body, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(body)
+            
+            if len(fields) == DATA_MSG_LENGTH:
+                self._update_top(*fields)
+            elif len(fields) == EOF_MSG_LENGTH:
+                self._send_final_result(fields[0])
+            
+            ack()
+        except Exception as e:
+            logging.error(f"Aggregator {self.id}: Error processing message: {e}")
+            nack(requeue=True)
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
-
+        logging.info(f"Aggregator {self.id}: Consuming from {self.config.AGGREGATION_PREFIX}_{self.id}")
+        self.input_exchange.start_consuming(self.on_message_received)
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
-    return 0
-
+    config = Config()
+    logging.basicConfig(level=config.LOG_LEVEL)
+    aggregator = AggregationFilter(config)
+    aggregator.start()
 
 if __name__ == "__main__":
     main()

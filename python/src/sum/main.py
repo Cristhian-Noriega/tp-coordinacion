@@ -1,69 +1,93 @@
 import os
 import logging
-import threading
-
 from common import middleware, message_protocol, fruit_item
 
-ID = int(os.environ["ID"])
-MOM_HOST = os.environ["MOM_HOST"]
-INPUT_QUEUE = os.environ["INPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
-AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+# cambio el sum para manejar datos por cliente
+# ahora acumulo frutas por cliente, y cuando llega un EOF envio todo a UN solo Aggregator (por ahora)
+
+
+DATA_MSG_LENGTH = 3
+EOF_MSG_LENGTH = 1
+
+class Config: 
+    ID = int(os.environ.get("ID", 0))
+    MOM_HOST = os.environ.get("MOM_HOST", "localhost")
+    INPUT_QUEUE = os.environ.get("INPUT_QUEUE", "input")
+    AGGREGATION_AMOUNT = int(os.environ.get("AGGREGATION_AMOUNT", 1))
+    AGGREGATION_PREFIX = os.environ.get("AGGREGATION_PREFIX", "output")
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 class SumFilter:
-    def __init__(self):
+    def __init__(self, config: Config):
+        self.id = config.ID
+        self.config = config
+        # siendo client id -> fruta -> acumulado, y  FruitItem para suma y orden
+        self.storage: dict[str, dict[str, fruit_item.FruitItem]] = {}
+        
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
+            self.config.MOM_HOST, self.config.INPUT_QUEUE
         )
+        
         self.data_output_exchanges = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+        self._init_output_exchanges()
+
+    # inicializo conexiones a exchanges de salida (uno por Aggregator)
+    def _init_output_exchanges(self):
+        for i in range(self.config.AGGREGATION_AMOUNT):
+            exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                self.config.MOM_HOST, 
+                self.config.AGGREGATION_PREFIX, 
+                [f"{self.config.AGGREGATION_PREFIX}_{i}"]
             )
-            self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
+            self.data_output_exchanges.append(exchange)
 
-    def _process_data(self, fruit, amount):
-        logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+    def _update_accumulation(self, client_id: str, fruit: str, amount: int):
+        client_data = self.storage.setdefault(client_id, {})
+        current_item = client_data.get(fruit, fruit_item.FruitItem(fruit, 0))
+        client_data[fruit] = current_item + fruit_item.FruitItem(fruit, int(amount))
+        logging.debug(f"Sum {self.id}: Client {client_id} updated {fruit}.")
 
-    def _process_eof(self):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+    def _flush_client_data(self, client_id: str):
+        if client_id not in self.storage:
+            logging.warning(f"Sum {self.id}: Received EOF for unknown client {client_id}")
+            return
 
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+        for item in self.storage[client_id].values():
+            msg = message_protocol.internal.serialize_client_data(
+                client_id, item.fruit, item.amount
+            )
+            self._broadcast(msg)
 
+        self._broadcast(message_protocol.internal.serialize_client_eof(client_id))
+        del self.storage[client_id]
+        logging.info(f"Sum {self.id}: Client {client_id} processed and cleared.")
 
-    def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof(*fields)
-        ack()
+    def _broadcast(self, payload: bytes):
 
+        for exchange in self.data_output_exchanges:
+            exchange.send(payload)
+
+    def on_message_received(self, body, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(body)
+            if len(fields) == DATA_MSG_LENGTH:
+                self._update_accumulation(*fields)
+            elif len(fields) == EOF_MSG_LENGTH:
+                self._flush_client_data(fields[0])
+            ack()
+        except Exception as e:
+            logging.error(f"Sum {self.id}: Error processing message: {e}")
+            nack()
+            
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        logging.info(f"Sum {self.id}: Starting consumer on {self.config.INPUT_QUEUE}...")
+        self.input_queue.start_consuming(self.on_message_received)
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    sum_filter = SumFilter()
+    config = Config()
+    logging.basicConfig(level=config.LOG_LEVEL)
+    sum_filter = SumFilter(config)
     sum_filter.start()
-    return 0
-
 
 if __name__ == "__main__":
     main()
