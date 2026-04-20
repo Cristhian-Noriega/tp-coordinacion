@@ -36,6 +36,16 @@ class SumFilter:
         self.storage_lock = threading.Lock()
         self.processed_clients_lock = threading.Lock()
 
+        # creo un lock unico para ver la cantidad de mensajes in flight. Esto lo van a ver control y data threads
+        self.in_flight_count = 0
+        self.in_flight_lock = threading.Lock()
+
+        # creo un dict que mapea cada client id a su threading event. Un event es una señal que se puede setear y waitear hilos
+        # con estos events, el data thread llama a set y el control thread atiende el EOF y hace wait al event
+        self.drain_events: dict[str, threading.Event] = {}
+        self.drain_events_lock = threading.Lock()
+        
+
     # inicializo conexiones a exchanges de salida (uno por Aggregator)
     def _init_output_exchanges(self):
         for i in range(self.config.AGGREGATION_AMOUNT):
@@ -95,8 +105,19 @@ class SumFilter:
     def on_message_received(self, body, ack, nack):
         try:
             fields = message_protocol.internal.deserialize(body)
+
+            # PROBLEMAaa -> no hay ningun registro de que ese mensaje esta en vuelo. El hilo de datos procesa y listo
+            # el hilo de control no tiene forma de saber cuantos mensajes estan siendo procesados en este momento
+            # 
+            # con el lock tomado, ahora debo incrementar el in flight count
             if len(fields) == DATA_MSG_LENGTH:
+                with self.in_flight_lock:
+                    self.in_flight_count += 1
                 self._update_accumulation(*fields)
+                with self.in_flight_lock and self.drain_events_lock:
+                    if self.in_flight_count == 0 and self.drain_events.get(fields[0]):
+                        self.drain_events[fields[0]].set()
+                    self.in_flight_count -= 1
             elif len(fields) == EOF_MSG_LENGTH:
                 #self._flush_client_data(fields[0])
                 # cuando me llega un EOF, debo mandar un signal a los demas Sums por el fanout exchange 
@@ -117,12 +138,27 @@ class SumFilter:
         # agrego proteccion de concurrencia con locks porque el callback de control y el callback de datos pueden correr concurrentemente y ambos acceden a processed_clients y al storage para hacer flush
         try:
             client_id = message_protocol.internal.deserialize_control_signal(body)
-            with self.processed_clients_lock:
+
+            # PROBLEMAAAA -> luego del lock, se flushea al aggregator los datos el control thread
+            # SIN SABER si en el data thead llegaron todos los datos de ese cliente
+
+            # debo agregar la espera, crear el event, guardarlo en drain_events, verificar si ya es 0, llamar a wait
+            # y luego limpiar el event del dict despues del flush
+            
+            with self.processed_clients_lock and self.drain_events_lock:
                 if client_id in self.processed_clients:
                     logging.warning(f"Sum {self.id}: Duplicate EOF signal for client {client_id}, ignoring.")
                     ack()
                     return
                 self.processed_clients.add(client_id)
+            
+            with self.in_flight_lock and self.drain_events_lock:
+                event = threading.Event()
+                self.drain_events[client_id] = event # lo guardo para que el data thread lo pueda usar
+                if self.in_flight_count == 0:
+                    event.set() # si ya no hay nada en vuelo, lo setea el mismo
+            
+            event.wait() # espero a que el data thread termine de procesar
 
             logging.info(f"Sum {self.id}: Flushing client {client_id} from control signal.")
             self._flush_client_data(client_id)

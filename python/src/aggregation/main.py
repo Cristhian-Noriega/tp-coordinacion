@@ -96,7 +96,7 @@ class AggregationFilter:
             
         except Exception as e:
             logging.error(f"Aggregator {self.id}: Error processing message: {e}")
-            nack(requeue=True)
+            nack()
 
     def start(self):
         logging.info(f"Aggregator {self.id}: Consuming from {self.config.AGGREGATION_PREFIX}_{self.id}")
