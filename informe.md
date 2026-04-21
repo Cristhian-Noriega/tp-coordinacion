@@ -72,3 +72,17 @@ Supuestos: la solución es correcta bajo las condiciones ordinarias del sistema 
 
 Otra aclaracion es el uso de threads. que al realizar operaciones I/O bound, el GIL de python se libera durante ese tipo de operaciones y llamadas bloqueantes, permitiendo que el hilo de datos y el hilo de control se solapen sin competir por CPU.  
 
+
+## Multiples replicas de Aggregators (escenario 4)
+
+Para este escenario, se realizo un routing deterministico por fruta. En vez de tener un broadcast de datos, se tiene un routing basado en hash sobre el nombre de la fruta. Con esto, la misma fruta siempre va a al mismo aggregator, independientemente de la instancia de Sum que lo esta enviando. Entonces un solo aggregator mantiene la suma total de una particion disjunta de frutas. 
+
+El EOF de cada Sum sigue siendo un broadcast a todos los aggregators porque cada uno necesita recibir SUM_AMOUNT EOFs para saber cuando cerrar su barrera y enviar su top parcial. 
+
+Por el lado del joiner, se implementa una segunda barrera que consiste en acumualr el aggregation amount tops parciales por cliente. Cuando los recibe todos, fusiona las listas, ordena por cantidad descendente y toma los mejores top size. 
+
+Como guarda, se agrego que si un aggregator no recibio datos de un cliente (porque ninguna fruta de su particion fue enviada por ese cliente) , igual se envia un resultado vacio al joiner, para no trabarlo. 
+
+
+
+
