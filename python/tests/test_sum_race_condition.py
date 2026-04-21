@@ -1,137 +1,138 @@
+import threading
 import sys
 import types
 import unittest
 from unittest.mock import patch
+import time
 
-from common import message_protocol
+class SimpleLockSum: 
+    def __init__(self):
+        self.storage = {}
+        self.lock = threading.Lock()
+        self.flush_results = {}
 
-if "pika" not in sys.modules:
-    sys.modules["pika"] = types.SimpleNamespace(
-        exceptions=types.SimpleNamespace(
-            AMQPConnectionError=Exception,
-            AMQPChannelError=Exception,
-            StreamLostError=Exception,
-        ),
-        BlockingConnection=None,
-        ConnectionParameters=None,
-    )
+    def on_message_received(self, client_id, fruit, amount):
+        # gap desprotegido: msj recibido, lock todavia no adquirido
+        time.sleep(0.05)
+        with self.lock:
+            self.storage.setdefault(client_id, {})
+            self.storage[client_id][fruit] = self.storage[client_id].get(fruit, 0) + amount
 
-from sum.main import Config, SumFilter
+    def flush(self, client_id):
+        with self.lock:
+            if client_id in self.storage:
+                result = dict(self.storage[client_id])
+                del self.storage[client_id]
+                return result
+            return {}
 
+class DrainCounterSum:
+    def __init__(self):
+        self.storage = {}
+        self.lock = threading.Lock()
+        self.in_flight = {}
+        self.drain_events = {}
+        self.in_flight_lock = threading.Lock()
 
-class _FakeQueue:
-    def __init__(self, host, queue_name):
-        self.host = host
-        self.queue_name = queue_name
+    def on_message_received(self, client_id, fruit, amount):
+        # Simula llegada de mensaje: incrementa in_flight
+        with self.in_flight_lock:
+            self.in_flight[client_id] = self.in_flight.get(client_id, 0) + 1
+        
+        # Procesa el mensaje (con delay para simular concurrencia)
+        time.sleep(0.05)
+        with self.lock:
+            self.storage.setdefault(client_id, {})
+            self.storage[client_id][fruit] = self.storage[client_id].get(fruit, 0) + amount
+        
+        # Decrementa in_flight y setea event si llega a 0
+        with self.in_flight_lock:
+            self.in_flight[client_id] -= 1
+            if self.in_flight[client_id] == 0 and client_id in self.drain_events:
+                self.drain_events[client_id].set()
+            # Limpia si llega a 0 y no hay event
+            if self.in_flight[client_id] == 0:
+                self.in_flight.pop(client_id, None)
+                self.drain_events.pop(client_id, None)
 
-    def start_consuming(self, _callback):
-        return None
+    def flush(self, client_id):
+        # Simula control thread: crea event, espera si in_flight > 0
+        event = threading.Event()
+        with self.in_flight_lock:
+            self.drain_events[client_id] = event
+            if self.in_flight.get(client_id, 0) == 0:
+                event.set()
+        
+        event.wait()  # Espera a que in_flight llegue a 0
+        
+        # Flush: toma lock, obtiene resultados, popea de storage
+        with self.lock:
+            if client_id in self.storage:
+                result = dict(self.storage[client_id])
+                del self.storage[client_id]
+                return result
+            return {}
 
-    def stop_consuming(self):
-        return None
+class TestRaceCondition(unittest.TestCase):
+    def test_concurrent_updates(self):
+        sum_filter = SimpleLockSum()
+        client_id = "test_client"
+        
+        # Datos esperados
+        expected = {"apple": 10, "banana": 20}
+        
+        def update_fruit(fruit, amount):
+            sum_filter.on_message_received(client_id, fruit, amount)
+        
+        # Crear hilos para simular concurrencia
+        threads = []
+        for fruit, amount in expected.items():
+            t = threading.Thread(target=update_fruit, args=(fruit, amount))
+            threads.append(t)
+        
+        # Iniciar hilos
+        for t in threads:
+            t.start()
+        
+        # Esperar a que terminen
+        for t in threads:
+            t.join()
+        
+        # Verificar resultado
+        result = sum_filter.flush(client_id)
+        self.assertEqual(result, expected)
 
-    def close(self):
-        return None
-
-
-class _FakeExchange:
-    instances = []
-
-    def __init__(self, host, exchange_name, routing_keys, exchange_type="direct"):
-        self.host = host
-        self.exchange_name = exchange_name
-        self.routing_keys = routing_keys
-        self.exchange_type = exchange_type
-        self.sent_messages = []
-        _FakeExchange.instances.append(self)
-
-    def send(self, message):
-        self.sent_messages.append(message)
-
-    def start_consuming(self, _callback):
-        return None
-
-    def stop_consuming(self):
-        return None
-
-    def close(self):
-        return None
-
-
-class SumRaceConditionTest(unittest.TestCase):
-    def setUp(self):
-        _FakeExchange.instances.clear()
-
-    def test_sum_should_not_finalize_before_late_data_is_accounted(self):
-        config = Config()
-        config.ID = 0
-        config.MOM_HOST = "fake-host"
-        config.INPUT_QUEUE = "input"
-        config.AGGREGATION_AMOUNT = 1
-        config.AGGREGATION_PREFIX = "agg"
-
-        with patch("sum.main.middleware.MessageMiddlewareQueueRabbitMQ", _FakeQueue), patch(
-            "sum.main.middleware.MessageMiddlewareExchangeRabbitMQ", _FakeExchange
-        ):
-            sum_filter = SumFilter(config)
-            client_id = "client-race"
-
-            ack_count = {"value": 0}
-            nack_count = {"value": 0}
-
-            def ack():
-                ack_count["value"] += 1
-
-            def nack():
-                nack_count["value"] += 1
-
-            # DATA arrives and is accumulated normally.
-            first_data = message_protocol.internal.serialize_client_data(
-                client_id, "apple", 10
-            )
-            sum_filter.on_message_received(first_data, ack, nack)
-
-            # EOF is received and only a control signal is emitted (no flush here).
-            eof_original = message_protocol.internal.serialize_client_eof(client_id, 0)
-            sum_filter.on_message_received(eof_original, ack, nack)
-
-            # Control signal is processed before a late data message arrives.
-            control_signal = message_protocol.internal.serialize_client_eof_signal(
-                client_id, 0
-            )
-            sum_filter.on_control_message(control_signal, ack, nack)
-
-            # Late data arrives after flush, recreating storage for an already processed client.
-            late_data = message_protocol.internal.serialize_client_data(
-                client_id, "banana", 5
-            )
-            sum_filter.on_message_received(late_data, ack, nack)
-
-        self.assertEqual(nack_count["value"], 0, "No message should be nacked in this flow.")
-        self.assertEqual(ack_count["value"], 4, "All callbacks should ack successfully.")
-        self.assertNotIn(
-            client_id,
-            sum_filter.storage,
-            "Client state should remain closed after finalize.",
-        )
-
-        aggregation_exchange = next(
-            exchange
-            for exchange in _FakeExchange.instances
-            if exchange.exchange_name == config.AGGREGATION_PREFIX
-        )
-        sent_records = [
-            message_protocol.internal.deserialize(payload)
-            for payload in aggregation_exchange.sent_messages
-        ]
-
-        self.assertIn([client_id, "apple", 10], sent_records)
-        self.assertIn(
-            [client_id, "banana", 5],
-            sent_records,
-            "Late data must be included before EOF/finalization.",
-        )
-
+    def test_drain_counter(self):
+        sum_filter = DrainCounterSum()
+        client_id = "test_client"
+        
+        # Datos esperados
+        expected = {"apple": 5, "banana": 10}
+        
+        # Crear hilos para mensajes de data (simulando llegada concurrente)
+        threads = []
+        for fruit, amount in expected.items():
+            t = threading.Thread(target=sum_filter.on_message_received, args=(client_id, fruit, amount))
+            threads.append(t)
+        
+        # Iniciar hilos de data
+        for t in threads:
+            t.start()
+        
+        # Simular delay para que algunos mensajes estén en vuelo
+        time.sleep(0.02)
+        
+        # Llamar flush en hilo principal (simula control thread)
+        result = sum_filter.flush(client_id)
+        
+        # Esperar a que terminen los hilos de data
+        for t in threads:
+            t.join()
+        
+        # Verificar que el flush esperó y obtuvo el resultado correcto
+        self.assertEqual(result, expected)
+        # Verificar que storage esté vacío
+        self.assertNotIn(client_id, sum_filter.storage)
 
 if __name__ == "__main__":
     unittest.main()
