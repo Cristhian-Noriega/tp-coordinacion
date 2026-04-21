@@ -3,6 +3,7 @@ import logging
 from common import middleware, message_protocol, fruit_item
 import threading
 import zlib
+import signal
 
 # cambio el sum para manejar datos por cliente
 # ahora acumulo frutas por cliente, y cuando llega un EOF envio todo a UN solo Aggregator (por ahora)
@@ -197,8 +198,26 @@ class SumFilter:
         # aca tengo que crear la cola privada para este sum y bindearla al exchange de control
         self.control_receiver.start_consuming(self.on_control_message)
         logging.info(f"Sum {self.id}: Started consuming control messages on {self.control_receiver._exchange_name}")
+
+    def _handle_sigterm(self, signum, frame):
+        self.input_queue.stop_consuming()
+
+    def _shutdown(self):
+        for resource in [self.input_queue, self.control_sender, self.control_receiver] + self.data_output_exchanges:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Sum {self.id}: Error closing resource: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._shutdown()
+                
             
     def start(self):
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         control_thread = threading.Thread(target=self._consume_control, daemon=True)
         logging.info(f"Sum {self.id}: Starting control thread for {self.control_receiver._exchange_name}...")
         control_thread.start()
@@ -206,11 +225,13 @@ class SumFilter:
         logging.info(f"Sum {self.id}: Starting consumer on {self.config.INPUT_QUEUE}...")
         self.input_queue.start_consuming(self.on_message_received)
 
+        self._shutdown()
+
 def main():
     config = Config()
     logging.basicConfig(level=config.LOG_LEVEL)
-    sum_filter = SumFilter(config)
-    sum_filter.start()
+    with SumFilter(config) as sum_filter:
+        sum_filter.start()
 
 if __name__ == "__main__":
     main()
