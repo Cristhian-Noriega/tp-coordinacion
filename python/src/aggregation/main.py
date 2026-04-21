@@ -52,22 +52,25 @@ class AggregationFilter:
 
         bisect.insort(fruit_list, new_item)
 
-    def _send_final_result(self, client_id: str):
+    def _send_partial_result(self, client_id: str):
         # al recibir EOF, tomo el top de frutas y lo envío al joiner
+
+        # update: ahora envial el top parcial de su particionde frutas al joiner
+        # el joiner acumula AGGREGATION_AMOUNT tops parciales y calcula el top global 
         if client_id not in self.storage:
             logging.warning(f"Aggregator {self.id}: No data for client {client_id}")
             return
 
-        top_items = self.storage[client_id][-self.config.TOP_SIZE:]
+        top_items = self.storage.get(client_id, [])[-self.config.TOP_SIZE:]
         top_items.reverse()
 
         formatted_results = [(fruit_item.fruit, fruit_item.amount) for fruit_item in top_items]
 
-        logging.info(f"Aggregator {self.id}: Sending TOP {self.config.TOP_SIZE} for client {client_id}")
+        logging.info(f"Aggregator {self.id}: Sending partial TOP for client {client_id}: {formatted_results}")
         
         msg = message_protocol.internal.serialize_client_result(client_id, formatted_results)
         self.output_queue.send(msg)
-        del self.storage[client_id]
+        self.storage.pop(client_id, None)
 
     def on_message_received(self, body, ack, nack):
         try:
@@ -89,7 +92,7 @@ class AggregationFilter:
                            f"({len(self.sums_completed[client_id])}/{self.config.SUM_AMOUNT})")
                 
                 if len(self.sums_completed[client_id]) == self.sum_amount:
-                    self._send_final_result(client_id)
+                    self._send_partial_result(client_id)
                     del self.sums_completed[client_id]
             
             ack()

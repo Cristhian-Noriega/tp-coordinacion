@@ -2,6 +2,7 @@ import os
 import logging
 from common import middleware, message_protocol, fruit_item
 import threading
+import zlib
 
 # cambio el sum para manejar datos por cliente
 # ahora acumulo frutas por cliente, y cuando llega un EOF envio todo a UN solo Aggregator (por ahora)
@@ -93,7 +94,7 @@ class SumFilter:
             msg = message_protocol.internal.serialize_client_data(
                 client_id, item.fruit, item.amount
             )
-            self._broadcast(msg)
+            self._route(item.fruit, msg)
 
         self._broadcast(message_protocol.internal.serialize_client_eof(client_id, self.id))
         logging.info(f"Sum {self.id}: Client {client_id} flushed and cleared.")
@@ -101,6 +102,10 @@ class SumFilter:
     def _broadcast(self, payload: bytes):
         for exchange in self.data_output_exchanges:
             exchange.send(payload)
+
+    def _route(self, fruit: str, payload: bytes):
+        index = zlib.crc32(fruit.encode()) % len(self.data_output_exchanges)
+        self.data_output_exchanges[index].send(payload)
 
     def on_message_received(self, body, ack, nack):
         try:
