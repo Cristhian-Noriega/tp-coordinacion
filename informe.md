@@ -12,7 +12,7 @@ Estado de los nodos (Sum, Aggregator, Joiner): Se refactorizó la gestión de me
 
 ---
 
-## 2. Coordinación de Terminación (Fanout Exchange)
+## 2. Coordinación de Terminación (Escenario 3 - Fanout Exchange)
 El Gateway emite un solo EOF por cliente, pero la capa Sum consume de una cola compartida en modalidad Round-Robin. Para que todas las instancias de Sum se enteren del cierre, se diseñó un canal de control dedicado usando un exchange de tipo fanout.
 
 Implementación:
@@ -42,5 +42,33 @@ El Aggregator recibe los EOFs de todos los Sum y, creyendo que todos los datos f
 
 Problema: El hilo principal de algún Sum todavía tiene mensajes de ese cliente pendientes de procesar en su input_queue local, porque el Round-Robin distribuyó esos mensajes antes del EOF pero el procesamiento no terminó antes de que llegara la señal de control.
 
+---
 
+## 4. Solucion
+
+Un punto a mencionar, es que la race condition anterior es intra-nodo, es decir, ocurre entre dos hilos del mismo proceso, no entre nodos distintos. Cada Sum necesitan garantizar que sus propios mensajes en vuelo fueron procesados antes de hacer flush. No requiere una coordinacion con los demas Sums. 
+
+Teniendo esto en cuenta, se implemento un mecanismo de drain counter con tres estructuras compartidas entre el hilo de datos y el de control de cada nodo Sum: 
+
+* in_flight: contador de mensajes por cada cliente. 
+* drain_events: un `threading.Event` por cliente, creado por el hilo de control al recibir un EOF signal. Es como la "comunicacion" o "coordinacion" entre los dos hilos
+* is_flight_lock: un unico lock que protege ambas estructuras de forma atomica. Es muy importante que sea uno solo, ya que si estuviera por separado, el hilo de datos podria decrementar a 0 entre los dos acquires del hilo de control, y el event quedaria sin setearse nunca.
+
+
+Para esta solucion fue importante familiarizarse con los events de threading, y operaciones como: 
+
+* `event.wait()` si flag == false bloquea el hilo hasta que alguien llame a `set()`
+* `event.set()` pone flag = true y despierta.a todos los hilos qque esten en `wait()`
+* `event.clear()` restea flag = false
+
+El flujo de coordinación es el siguiente:
+
+El hilo de datos incrementa in_flight[client_id] en cuanto on_message_received es invocado — antes de cualquier procesamiento. Al terminar la acumulación, lo decrementa. Si llega a 0 y existe un Event en drain_events para ese cliente, llama a event.set().
+El hilo de control, al recibir la señal de EOF, crea un threading.Event y lo registra en drain_events[client_id] bajo in_flight_lock. Dentro del mismo lock verifica si in_flight[client_id] ya es 0; si es así, setea el event él mismo (el hilo de datos ya terminó). Luego llama a event.wait().
+Solo cuando event.wait() retorna ejecuta _flush_client_data, garantizando que todos los datos del cliente fueron acumulados. La atomicidad del lock garantiza que no existe una ventana de tiempo en la que el hilo de datos decrementa a 0 sin ver el event, y el hilo de control crea el event sin ver que el contador ya es 0. Exactamente uno de los dos hilos setea el event.
+
+
+Supuestos: la solución es correcta bajo las condiciones ordinarias del sistema — sin caída de nodos ni pérdida de mensajes en el broker, tal como establece el enunciado. RabbitMQ garantiza orden FIFO dentro de una cola, por lo que el control signal viaja por red con latencia de varios milisegundos mientras que el gap entre mensajes consecutivos en el mismo consumer (con prefetch_count=1) es sub-milisegundo. En condiciones ordinarias, este gap no es alcanzable por el control signal. Los escenarios causados de fallas de conexión o caída de nodos quedan fuera del scope.
+
+Otra aclaracion es el uso de threads. que al realizar operaciones I/O bound, el GIL de python se libera durante ese tipo de operaciones y llamadas bloqueantes, permitiendo que el hilo de datos y el hilo de control se solapen sin competir por CPU.  
 
