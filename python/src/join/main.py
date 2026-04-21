@@ -23,7 +23,7 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         # necesito acumular los tops parciales por cliente
-        self.partial_tops: dict[str, int] = {}
+        self.partial_tops: dict[str, list] = {}
         self.agg_completed: dict[str, int] = {} # esto para saber cuantos aggs respondieron
 
     def process_messsage(self, message, ack, nack):

@@ -86,6 +86,8 @@ class SumFilter:
         with self.storage_lock:
             if client_id not in self.storage:
                 logging.warning(f"Sum {self.id}: No data for client {client_id}, skipping flush.")
+                # igual tengo que mandar el EOF porque si no, el Join se queda esperando un resultado que nunca llega porque el control thread no sabe que ese cliente ya no tiene datos y que ya se procesó
+                self._broadcast(message_protocol.internal.serialize_client_eof(client_id, self.id))
                 return
             items = list(self.storage[client_id].values())
             del self.storage[client_id]
