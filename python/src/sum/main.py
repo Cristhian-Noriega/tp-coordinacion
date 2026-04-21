@@ -37,13 +37,13 @@ class SumFilter:
         self.processed_clients_lock = threading.Lock()
 
         # creo un lock unico para ver la cantidad de mensajes in flight. Esto lo van a ver control y data threads
-        self.in_flight_count = 0
+        self.in_flight: dict[str, int] = {}
+        # este lock lo comparten para in flight y drain events
         self.in_flight_lock = threading.Lock()
 
         # creo un dict que mapea cada client id a su threading event. Un event es una señal que se puede setear y waitear hilos
         # con estos events, el data thread llama a set y el control thread atiende el EOF y hace wait al event
         self.drain_events: dict[str, threading.Event] = {}
-        self.drain_events_lock = threading.Lock()
         
 
     # inicializo conexiones a exchanges de salida (uno por Aggregator)
@@ -111,13 +111,26 @@ class SumFilter:
             # 
             # con el lock tomado, ahora debo incrementar el in flight count
             if len(fields) == DATA_MSG_LENGTH:
+                client_id = fields[0]
+                with self.processed_clients_lock:
+                    if client_id in self.processed_clients:
+                        logging.warning(f"Sum {self.id}: Ignoring data message for already processed client {client_id}")
+                        ack()
+                        return
                 with self.in_flight_lock:
-                    self.in_flight_count += 1
+                    logging.info(f"Sum {self.id}: Incrementing in_flight for client {client_id} (current: {self.in_flight.get(client_id, 0)})")
+                    self.in_flight[client_id] = self.in_flight.get(client_id, 0) + 1
                 self._update_accumulation(*fields)
-                with self.in_flight_lock and self.drain_events_lock:
-                    if self.in_flight_count == 0 and self.drain_events.get(fields[0]):
-                        self.drain_events[fields[0]].set()
-                    self.in_flight_count -= 1
+                with self.in_flight_lock:
+                    # decremento antes del check
+                    self.in_flight[client_id] -= 1
+                    logging.info(f"Sum {self.id}: Decremented in_flight for client {client_id} (remaining: {self.in_flight[client_id]}). Event set: {client_id in self.drain_events}")
+                    if self.in_flight[client_id] == 0:
+                        if client_id in self.drain_events:
+                            self.drain_events[client_id].set()
+                        del self.in_flight[client_id]
+                        self.drain_events.pop(client_id, None) # limpio el event por las dudas, si ya se seteo y se hizo wait, no hace nada, y si no se seteo, lo borro del dict para que no quede basura
+                        
             elif len(fields) == EOF_MSG_LENGTH:
                 #self._flush_client_data(fields[0])
                 # cuando me llega un EOF, debo mandar un signal a los demas Sums por el fanout exchange 
@@ -145,21 +158,29 @@ class SumFilter:
             # debo agregar la espera, crear el event, guardarlo en drain_events, verificar si ya es 0, llamar a wait
             # y luego limpiar el event del dict despues del flush
             
-            with self.processed_clients_lock and self.drain_events_lock:
+            with self.processed_clients_lock:
+                logging.info(f"Sum {self.id}: Processing EOF signal for client {client_id}. Already processed: {client_id in self.processed_clients}")
                 if client_id in self.processed_clients:
                     logging.warning(f"Sum {self.id}: Duplicate EOF signal for client {client_id}, ignoring.")
                     ack()
                     return
                 self.processed_clients.add(client_id)
-            
-            with self.in_flight_lock and self.drain_events_lock:
-                event = threading.Event()
+
+            event = threading.Event()
+            logging.info(f"Sum {self.id}: Creating drain event for client {client_id}. In-flight count: {self.in_flight.get(client_id, 0)}")
+            with self.in_flight_lock:
                 self.drain_events[client_id] = event # lo guardo para que el data thread lo pueda usar
-                if self.in_flight_count == 0:
+                if self.in_flight.get(client_id, 0) == 0:
                     event.set() # si ya no hay nada en vuelo, lo setea el mismo
             
             event.wait() # espero a que el data thread termine de procesar
+            logging.info(f"Sum {self.id}: Drain completed for client {client_id}. Proceeding to flush.")
 
+            # limpio l event del dict despues del flush 
+            with self.in_flight_lock:
+                del self.drain_events[client_id]
+
+            logging.info(f"Sum {self.id}: Event cleaned for client {client_id}. Ready to flush.")
             logging.info(f"Sum {self.id}: Flushing client {client_id} from control signal.")
             self._flush_client_data(client_id)
             ack()
