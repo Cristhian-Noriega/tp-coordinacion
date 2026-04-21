@@ -204,30 +204,58 @@ class SumFilter:
     def _handle_sigterm(self, signum, frame):
         self.input_queue.stop_consuming()
 
-    def _shutdown(self):
-        for resource in [self.input_queue, self.control_sender, self.control_receiver] + self.data_output_exchanges:
-            try:
-                resource.close()
-            except Exception as e:
-                logging.error(f"Sum {self.id}: Error closing resource: {e}")
-
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         self._shutdown()
+
+    def _shutdown(self):
+        # for resource in [self.input_queue, self.control_sender, self.control_receiver] + self.data_output_exchanges:
+        #     try:
+        #         resource.close()
+        #     except Exception as e:
+        #         logging.error(f"Sum {self.id}: Error closing resource: {e}")
+
+        # fase 1: desbloquear hilo de control cerrando su conexion
+        try:
+            self.control_receiver.close()
+        except Exception as e:
+            logging.error(f"Sum {self.id}: Error closing control receiver: {e}")
+        # fase 2: joinear hilo de control garantizando que termino antes de cerrar el resto
+
+        if self._control_thread.is_alive():
+            self._control_thread.join()
+            logging.info(f"Sum {self.id}: Control thread joined.")
+        
+        # fase 3: cerrar el resto de los recursos
+        for resource in [self.input_queue, self.control_sender] + self.data_output_exchanges:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Sum {self.id}: Error closing resource: {e}")
+
+
+
                 
             
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
-        control_thread = threading.Thread(target=self._consume_control, daemon=True)
+        #control_thread = threading.Thread(target=self._consume_control, daemon=True)
+
+        self._control_thread = threading.Thread(target=self._consume_control, daemon=True)
         logging.info(f"Sum {self.id}: Starting control thread for {self.control_receiver._exchange_name}...")
-        control_thread.start()
+        #control_thread.start()
+        self._control_thread.start()
 
         logging.info(f"Sum {self.id}: Starting consumer on {self.config.INPUT_QUEUE}...")
         self.input_queue.start_consuming(self.on_message_received)
 
-        self._shutdown()
+        #self._shutdown()
+
+        # cuando start_consuming termina por sigterm o por cualquier otro motivo, se sale del start
+        # y se ejecuta el shutdown
+        
 
 def main():
     config = Config()
