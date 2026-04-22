@@ -46,6 +46,7 @@ class SumFilter:
         # creo un dict que mapea cada client id a su threading event. Un event es una señal que se puede setear y waitear hilos
         # con estos events, el data thread llama a set y el control thread atiende el EOF y hace wait al event
         self.drain_events: dict[str, threading.Event] = {}
+        self._control_thread: threading.Thread | None = None
         
 
     # inicializo conexiones a exchanges de salida (uno por Aggregator)
@@ -84,13 +85,7 @@ class SumFilter:
 
     def _flush_client_data(self, client_id: str):
         with self.storage_lock:
-            if client_id not in self.storage:
-                logging.warning(f"Sum {self.id}: No data for client {client_id}, skipping flush.")
-                # igual tengo que mandar el EOF porque si no, el Join se queda esperando un resultado que nunca llega porque el control thread no sabe que ese cliente ya no tiene datos y que ya se procesó
-                self._broadcast(message_protocol.internal.serialize_client_eof(client_id, self.id))
-                return
-            items = list(self.storage[client_id].values())
-            del self.storage[client_id]
+            items = list(self.storage.pop(client_id, {}).values())
 
         # broadcast fuera del lock para no bloquearlo durante I/O
         for item in items:
@@ -198,8 +193,13 @@ class SumFilter:
 
     def _consume_control(self):
         # aca tengo que crear la cola privada para este sum y bindearla al exchange de control
-        self.control_receiver.start_consuming(self.on_control_message)
-        logging.info(f"Sum {self.id}: Started consuming control messages on {self.control_receiver._exchange_name}")
+        # self.control_receiver.start_consuming(self.on_control_message)
+        # logging.info(f"Sum {self.id}: Started consuming control messages on {self.control_receiver._exchange_name}")
+        try:
+            self.control_receiver.start_consuming(self.on_control_message)
+            logging.info(f"Sum {self.id}: Started consuming control messages on {self.control_receiver._exchange_name}")
+        except Exception as e:
+            logging.error(f"Sum {self.id}: Error in control thread: {e}")
 
     def _handle_sigterm(self, signum, frame):
         self.input_queue.stop_consuming()
@@ -224,7 +224,7 @@ class SumFilter:
             logging.error(f"Sum {self.id}: Error closing control receiver: {e}")
         # fase 2: joinear hilo de control garantizando que termino antes de cerrar el resto
 
-        if self._control_thread.is_alive():
+        if self._control_thread and self._control_thread.is_alive():
             self._control_thread.join()
             logging.info(f"Sum {self.id}: Control thread joined.")
         
