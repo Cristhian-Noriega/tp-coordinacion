@@ -108,9 +108,6 @@ class SumFilter:
     def on_message_received(self, body, ack, nack):
         try:
             fields = message_protocol.internal.deserialize(body)
-
-            # PROBLEMAaa -> no hay ningun registro de que ese mensaje esta en vuelo. El hilo de datos procesa y listo
-            # el hilo de control no tiene forma de saber cuantos mensajes estan siendo procesados en este momento
             # 
             # con el lock tomado, ahora debo incrementar el in flight count
             if len(fields) == DATA_MSG_LENGTH:
@@ -155,9 +152,7 @@ class SumFilter:
         try:
             client_id = message_protocol.internal.deserialize_control_signal(body)
 
-            # PROBLEMAAAA -> luego del lock, se flushea al aggregator los datos el control thread
-            # SIN SABER si en el data thead llegaron todos los datos de ese cliente
-
+           
             # debo agregar la espera, crear el event, guardarlo en drain_events, verificar si ya es 0, llamar a wait
             # y luego limpiar el event del dict despues del flush
             
@@ -181,7 +176,7 @@ class SumFilter:
 
             # limpio l event del dict despues del flush 
             with self.in_flight_lock:
-                del self.drain_events[client_id]
+                self.drain_events.pop(client_id, None)
 
             logging.info(f"Sum {self.id}: Event cleaned for client {client_id}. Ready to flush.")
             logging.info(f"Sum {self.id}: Flushing client {client_id} from control signal.")

@@ -1,6 +1,7 @@
 import os
 import logging
 import bisect
+import signal
 from typing import Dict, List, Set
 
 from common import middleware, message_protocol, fruit_item
@@ -101,15 +102,32 @@ class AggregationFilter:
             logging.error(f"Aggregator {self.id}: Error processing message: {e}")
             nack()
 
+    def _handle_sigterm(self, signum, frame):
+        self.input_exchange.stop_consuming()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._shutdown()
+
+    def _shutdown(self):
+        for resource in [self.input_exchange, self.output_queue]:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Aggregator {self.id}: Error closing resource: {e}")
+
     def start(self):
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         logging.info(f"Aggregator {self.id}: Consuming from {self.config.AGGREGATION_PREFIX}_{self.id}")
         self.input_exchange.start_consuming(self.on_message_received)
 
 def main():
     config = Config()
     logging.basicConfig(level=config.LOG_LEVEL)
-    aggregator = AggregationFilter(config)
-    aggregator.start()
+    with AggregationFilter(config) as aggregator:
+        aggregator.start()
 
 if __name__ == "__main__":
     main()

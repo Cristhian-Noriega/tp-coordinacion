@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -66,14 +67,31 @@ class JoinFilter:
         del self.partial_tops[client_id]
         del self.agg_completed[client_id]
     
+    def _handle_sigterm(self, signum, frame):
+        self.input_queue.stop_consuming()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._shutdown()
+
+    def _shutdown(self):
+        for resource in [self.input_queue, self.output_queue]:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Join: Error closing resource: {e}")
+
     def start(self):
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         self.input_queue.start_consuming(self.process_messsage)
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    join_filter = JoinFilter()
-    join_filter.start()
+    with JoinFilter() as join_filter:
+        join_filter.start()
 
     return 0
 

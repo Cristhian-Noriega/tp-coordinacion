@@ -83,6 +83,29 @@ Por el lado del joiner, se implementa una segunda barrera que consiste en acumua
 
 Como guarda, se agrego que si un aggregator no recibio datos de un cliente (porque ninguna fruta de su particion fue enviada por ese cliente) , igual se envia un resultado vacio al joiner, para no trabarlo. 
 
+## Escalabilidad
+
+El sistema escala en dos dimensiones: clientes y controllers.
+
+Respecto a los clientes, cada nodo mantiene estructuras indexadas por client_id. Agregar un cliente nuevo no requiere modificar el codigo, solo agregar una nueva cola en el middleware.
+
+Respecto a las replicas de Sum, la input_queue es compartida y se usa round-robin, entonces cada replica recibe una porcion de los mensajes.
+
+Respecto a las replicas de Aggregator, se puede escalar agregando mas instancias y distribuyendo las frutas entre ellas. Se usa routing deterministico por fruta, entonces la misma fruta siempre va al mismo aggregator, independientemente de la instancia de Sum que lo esta enviando.
+
+El joiner por su lado no es un cuello de botella, solo recibe tops parciales de tamano acotado independientemente de la cantidad de clientes o frutas. 
+
+
+## Graceful shutdown
+
+Al recibidr SIGTERM, el nodo Sum realiza un graceful shutdown en dos fases:
+
+1. desbloquear: el handler llama stop_consuming() sobre la input_queue, lo que desbloquea el loop principal. Luego _shutdown cierra la conexion de control_receiver, lo que lanza una excepcion en el hilo de control, que sale de su loop y se une al principal con join().
+
+2. recolectar: se hace un join del hilo de control para esperar que termine de procesar y luego se cierran todos los files descriptors restantes. 
+
+Esta idea tambien es aplicada en aggregator y join pero a nivel de solo un hilo.
+
 
 
 
