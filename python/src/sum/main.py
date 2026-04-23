@@ -219,8 +219,8 @@ class SumFilter:
             logging.error(f"Sum {self.id}: Error closing control receiver: {e}")
         # fase 2: joinear hilo de control garantizando que termino antes de cerrar el resto
 
-        if self._control_thread and self._control_thread.is_alive():
-            self._control_thread.join()
+        if self._control_thread is not None and self._control_thread.is_alive():
+            self._control_thread.join(timeout=5)
             logging.info(f"Sum {self.id}: Control thread joined.")
         
         # fase 3: cerrar el resto de los recursos
@@ -238,7 +238,7 @@ class SumFilter:
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         #control_thread = threading.Thread(target=self._consume_control, daemon=True)
 
-        self._control_thread = threading.Thread(target=self._consume_control, daemon=True)
+        self._control_thread = threading.Thread(target=self._consume_control)
         logging.info(f"Sum {self.id}: Starting control thread for {self.control_receiver._exchange_name}...")
         #control_thread.start()
         self._control_thread.start()
